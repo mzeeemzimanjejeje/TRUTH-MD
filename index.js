@@ -22,7 +22,8 @@
         let installed = false;
         for (const npm of npmCandidates) {
             try {
-                execSync(`${npm} install`, { stdio: 'inherit', cwd: dir });
+                // Use --legacy-peer-deps to avoid peer dependency conflicts
+                execSync(`${npm} install --legacy-peer-deps`, { stdio: 'inherit', cwd: dir });
                 installed = true;
                 console.log('✅ Dependencies installed successfully');
                 break;
@@ -32,7 +33,7 @@
         }
 
         if (!installed) {
-            console.error('❌ Could not install dependencies. Run: npm install');
+            console.error('❌ Could not install dependencies. Run: npm install --legacy-peer-deps');
             process.exit(1);
         }
     }
