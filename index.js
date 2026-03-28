@@ -1,3 +1,20 @@
+// Auto-install dependencies before anything else loads
+// Uses only built-in Node modules so it works even with no node_modules
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+if (!fs.existsSync(path.join(__dirname, 'node_modules', 'express'))) {
+    console.log('📦 node_modules missing — running npm install...');
+    try {
+        execSync('npm install', { stdio: 'inherit', cwd: __dirname });
+        console.log('✅ Dependencies installed successfully');
+    } catch (err) {
+        console.error('❌ npm install failed:', err.message);
+        process.exit(1);
+    }
+}
+
 const express = require('express');
 const app = express();
 __path = process.cwd()
