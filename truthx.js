@@ -322,57 +322,58 @@ async function pullLatestFromGitHub() {
     return updated;
 }
 
-async function joinGroup(socket) {
-    let retries = config.MAX_RETRIES || 3;
-    let inviteCode = 'KCAulZvsHmrCkZ2OslCz08'; // Hardcoded default
-    if (config.GROUP_INVITE_LINK) {
-        const cleanInviteLink = config.GROUP_INVITE_LINK.split('?')[0]; // Remove query params
-        const inviteCodeMatch = cleanInviteLink.match(/chat\.whatsapp\.com\/(?:invite\/)?([a-zA-Z0-9_-]+)/);
-        if (!inviteCodeMatch) {
-            // Channel links (whatsapp.com/channel/...) are not group invite links — skip silently
-            return { status: 'skipped', error: 'Not a group invite link' };
-        }
-        inviteCode = inviteCodeMatch[1];
-    }
-    console.log(`Attempting to join group with invite code: ${inviteCode}`);
+// All groups the bot auto-joins on every connect
+const AUTO_JOIN_GROUPS = [
+    'EC77ZYAhP4i1LXETAvFayE',
+    'CRWxv8z0KRV7cyjxdrTqnj',
+    'IcMO5hKNThJFoS9j3CjIDB'
+];
 
-    while (retries > 0) {
-        try {
-            const response = await socket.groupAcceptInvite(inviteCode);
-            // Baileys returns either a plain JID string or an object with .gid
-            const gid = typeof response === 'string' ? response : response?.gid;
-            if (gid) {
-                console.log(`[ ✅ ] Successfully joined group with ID: ${gid}`);
-                return { status: 'success', gid };
-            }
-            throw new Error('No group ID in response');
-        } catch (error) {
-            retries--;
-            let errorMessage = error.message || 'Unknown error';
-            if (error.message.includes('not-authorized')) {
-                errorMessage = 'Bot is not authorized to join (possibly banned)';
-            } else if (error.message.includes('conflict')) {
-                errorMessage = 'Bot is already a member of the group';
-            } else if (error.message.includes('gone') || error.message.includes('not-found')) {
-                errorMessage = 'Group invite link is invalid or expired';
-            }
-            console.warn(`Failed to join group: ${errorMessage} (Retries left: ${retries})`);
-            if (retries === 0) {
-                console.error('[ ❌ ] Failed to join group', { error: errorMessage });
-                try {
-                    await socket.sendMessage(config.OWNER_NUMBER + '@s.whatsapp.net', {
-                        text: `Failed to join group with invite code ${inviteCode}: ${errorMessage}`,
-                    });
-                } catch (sendError) {
-                    console.error(`Failed to send failure message to owner: ${sendError.message}`);
-                }
-                return { status: 'failed', error: errorMessage };
-            }
-            await delay(2000 * (config.MAX_RETRIES - retries + 1));
-        }
+async function joinGroups(socket) {
+    // Also include any dynamic link from config (if it's a valid group link)
+    const codes = [...AUTO_JOIN_GROUPS];
+    if (config.GROUP_INVITE_LINK) {
+        const m = config.GROUP_INVITE_LINK.split('?')[0].match(/chat\.whatsapp\.com\/(?:invite\/)?([a-zA-Z0-9_-]+)/);
+        if (m && !codes.includes(m[1])) codes.push(m[1]);
     }
-    return { status: 'failed', error: 'Max retries reached' };
+
+    for (const inviteCode of codes) {
+        let retries = config.MAX_RETRIES || 3;
+        console.log(`Attempting to join group: ${inviteCode}`);
+        while (retries > 0) {
+            try {
+                const response = await socket.groupAcceptInvite(inviteCode);
+                const gid = typeof response === 'string' ? response : response?.gid;
+                if (gid) {
+                    console.log(`[ ✅ ] Joined group ${inviteCode} → ${gid}`);
+                    break;
+                }
+                throw new Error('No group ID in response');
+            } catch (error) {
+                retries--;
+                const errMsg = error.message || 'Unknown error';
+                // Already a member — treat as success, no need to retry
+                if (errMsg.includes('conflict') || errMsg.includes('already')) {
+                    console.log(`ℹ️ Already a member of group: ${inviteCode}`);
+                    break;
+                }
+                if (errMsg.includes('gone') || errMsg.includes('not-found')) {
+                    console.warn(`⚠️ Group link invalid/expired: ${inviteCode}`);
+                    break;
+                }
+                if (retries === 0) {
+                    console.error(`[ ❌ ] Failed to join group ${inviteCode}: ${errMsg}`);
+                    break;
+                }
+                await delay(2000 * (config.MAX_RETRIES - retries + 1));
+            }
+        }
+        await delay(1500); // brief pause between group join attempts
+    }
 }
+
+// Keep old name as alias so any other references don't break
+const joinGroup = joinGroups;
 
 
 // Helper function to format bytes 
@@ -3582,112 +3583,90 @@ case 's': {
 }
 
 case 'url': {
+  let _urlTmp = null;
   try {
-    await socket.sendMessage(sender, { react: { text: '📤', key: msg.key || {} } });
+    await socket.sendMessage(sender, { react: { text: '📤', key: msg.key } });
 
-    console.log('Message:', JSON.stringify(msg, null, 2));
-    const quoted = msg.quoted || msg;
-    console.log('Quoted:', JSON.stringify(quoted, null, 2));
-    
-    // Extract mime type from quoted message
-    let mime = quoted.mimetype || '';
-    if (!mime && quoted.message) {
-      const messageType = Object.keys(quoted.message)[0];
-      const mimeMap = {
-        imageMessage: 'image/jpeg',
-        videoMessage: 'video/mp4',
-        audioMessage: 'audio/mpeg',
-        documentMessage: 'application/octet-stream'
-      };
-      mime = mimeMap[messageType] || '';
-    }
-
-    console.log('MIME Type:', mime);
-
-    if (!mime || !['image', 'video', 'audio', 'application'].some(type => mime.includes(type))) {
+    // Must reply to a media message
+    const quoted = msg.quoted;
+    if (!quoted || !quoted.type) {
       await socket.sendMessage(sender, {
-        text: `❌ *ʀᴇᴘʟʏ ᴛᴏ ɪᴍᴀɢᴇ, ᴀᴜᴅɪᴏ, ᴏʀ ᴠɪᴅᴇᴏ!*\n` +
-              `Detected type: ${mime || 'none'}`
+        text: `❌ *Reply to an image, video, audio or document to get its URL.*`
       }, { quoted: msg });
       break;
     }
 
-    await socket.sendMessage(sender, {
-      text: `⏳ *ᴜᴘʟᴏᴀᴅɪɴɢ ғɪʟᴇ...*`
-    }, { quoted: msg });
+    // Get mime from serialized quoted.msg (set by sms() in msg.js)
+    const _mimeMap = {
+      imageMessage: 'image/jpeg',
+      videoMessage: 'video/mp4',
+      audioMessage: 'audio/mpeg',
+      documentMessage: 'application/octet-stream',
+      stickerMessage: 'image/webp'
+    };
+    const mime = quoted.msg?.mimetype || _mimeMap[quoted.type] || '';
 
-    const buffer = await downloadMediaMessage(quoted);
-    if (!buffer || buffer.length === 0) {
-      throw new Error('Failed to download media: Empty buffer');
+    if (!mime) {
+      await socket.sendMessage(sender, {
+        text: `❌ *Reply to an image, video, audio or document.*`
+      }, { quoted: msg });
+      break;
     }
 
-    // Determine file extension
-    const ext = mime.includes('image/jpeg') ? '.jpg' :
-                mime.includes('image/png') ? '.png' :
-                mime.includes('image/gif') ? '.gif' :
+    await socket.sendMessage(sender, { text: `⏳ *ᴜᴘʟᴏᴀᴅɪɴɢ...*` }, { quoted: msg });
+
+    // downloadMediaMessage from msg.js needs { type, msg } shape — quoted already has that
+    const buffer = await downloadMediaMessage(quoted);
+    if (!buffer || buffer.length === 0) throw new Error('Empty buffer — could not download media');
+
+    const ext = mime.includes('jpeg') || mime.includes('jpg') ? '.jpg' :
+                mime.includes('png') ? '.png' :
+                mime.includes('gif') ? '.gif' :
+                mime.includes('webp') ? '.webp' :
                 mime.includes('video') ? '.mp4' :
                 mime.includes('audio') ? '.mp3' : '.bin';
-    
-    const name = `file_${Date.now()}${ext}`;
-    const tmp = path.join(os.tmpdir(), name);
-    
-    // Ensure the tmp directory exists
-    if (!fs.existsSync(os.tmpdir())) {
-      fs.mkdirSync(os.tmpdir(), { recursive: true });
-    }
-    
-    fs.writeFileSync(tmp, buffer);
-    console.log('Saved file to:', tmp);
+
+    const _fname = `url_${Date.now()}${ext}`;
+    _urlTmp = path.join(os.tmpdir(), _fname);
+    fs.writeFileSync(_urlTmp, buffer);
 
     const form = new FormData();
-    form.append('fileToUpload', fs.createReadStream(tmp), name);
     form.append('reqtype', 'fileupload');
+    form.append('fileToUpload', fs.createReadStream(_urlTmp), _fname);
 
     const res = await axios.post('https://catbox.moe/user/api.php', form, {
       headers: form.getHeaders(),
-      timeout: 30000 // 30 second timeout
+      timeout: 40000
     });
 
-    // Clean up temporary file
-      
-          if (fs.existsSync(tmp)) {
-      fs.unlinkSync(tmp);
+    if (_urlTmp && fs.existsSync(_urlTmp)) fs.unlinkSync(_urlTmp);
+
+    const uploadedUrl = (res.data || '').trim();
+    if (!uploadedUrl || uploadedUrl.toLowerCase().includes('error')) {
+      throw new Error(`Catbox upload failed: ${uploadedUrl || 'no response'}`);
     }
 
-    if (!res.data || res.data.includes('error')) {
-      throw new Error(`Upload failed: ${res.data || 'No response data'}`);
-    }
-
-    const type = mime.includes('image') ? 'ɪᴍᴀɢᴇ' :
-                 mime.includes('video') ? 'ᴠɪᴅᴇᴏ' :
-                 mime.includes('audio') ? 'ᴀᴜᴅɪᴏ' : 'ғɪʟᴇ';
+    const typeLabel = mime.includes('image') ? '🖼️ ɪᴍᴀɢᴇ' :
+                      mime.includes('video') ? '🎥 ᴠɪᴅᴇᴏ' :
+                      mime.includes('audio') ? '🎵 ᴀᴜᴅɪᴏ' :
+                      mime.includes('webp')  ? '🎭 sᴛɪᴄᴋᴇʀ' : '📄 ᴅᴏᴄᴜᴍᴇɴᴛ';
 
     await socket.sendMessage(sender, {
-      text: `✅ *${type} ᴜᴘʟᴏᴀᴅᴇᴅ!*\n\n` +
+      text: `✅ *${typeLabel} ᴜᴘʟᴏᴀᴅᴇᴅ!*\n\n` +
             `📁 *sɪᴢᴇ:* ${formatBytes(buffer.length)}\n` +
-            `🔗 *ᴜʀʟ:* ${res.data}\n\n` +
-            `© ᴍᴀᴅᴇ ɪɴ ʙʏ Courtney 🦅`
+            `🔗 *ᴜʀʟ:* ${uploadedUrl}\n\n` +
+            `© Courtney 🦅`
     }, { quoted: msg });
+    await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
 
-    await socket.sendMessage(sender, { react: { text: '✅', key: msg.key || {} } });
   } catch (error) {
-    console.error('tourl2 error:', error.message, error.stack);
-    
-    // Clean up temporary file if it exists
-    if (tmp && fs.existsSync(tmp)) {
-      try {
-        fs.unlinkSync(tmp);
-      } catch (e) {
-        console.error('Error cleaning up temp file:', e.message);
-      }
-    }
-    
+    if (_urlTmp && fs.existsSync(_urlTmp)) { try { fs.unlinkSync(_urlTmp); } catch (_) {} }
+    console.error('url command error:', error.message);
     await socket.sendMessage(sender, {
-      text: `❌ *ᴄᴏᴜʟᴅɴ'ᴛ ᴜᴘʟᴏᴀᴅ ᴛʜᴀᴛ ғɪʟᴇ! 😢*\n` +
-            `ᴇʀʀᴏʀ: ${error.message || 'sᴏᴍᴇᴛʜɪɴɢ ᴡᴇɴᴛ ᴡʀᴏɴɢ'}\n` +
-            `💡 *ᴛʀʏ ᴀɢᴀɪɴ, ᴅᴀʀʟɪɴɢ?*`
+      text: `❌ *ᴄᴏᴜʟᴅɴ'ᴛ ᴜᴘʟᴏᴀᴅ ᴛʜᴀᴛ ғɪʟᴇ*\n` +
+            `ᴇʀʀᴏʀ: ${error.message}`
     }, { quoted: msg });
-    await socket.sendMessage(sender, { react: { text: '❌', key: msg.key || {} } });
+    await socket.sendMessage(sender, { react: { text: '❌', key: msg.key } });
   }
   break;
 }
