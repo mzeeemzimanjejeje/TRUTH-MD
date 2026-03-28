@@ -1,6 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
-const { EmpirePair, pullLatestFromGitHub, activeSockets, NUMBER_LIST_PATH } = require('./pair');
+const { EmpirePair, pullLatestFromGitHub, activeSockets, NUMBER_LIST_PATH } = require('./truthx');
 
 const BOT_TOKEN = '8525922974:AAEFu_VG1Q8auPz1Yb-ZcajUxKpGxje3_mk';
 const OWNER_ID = '7131299411';
