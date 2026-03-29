@@ -307,18 +307,50 @@ function isSudo(num) { return getSudoList().includes(num); }
 
 // ─── GitHub Auto-Update ───────────────────────────────────────────────────────
 async function pullLatestFromGitHub() {
-    const filesToUpdate = ['truthx.js', 'telegram.js', 'index.js', 'msg.js'];
+    const filesToUpdate = [
+        'truthx.js', 'telegram.js', 'index.js', 'msg.js',
+        'package.json', 'newsletter.json', 'main.html', 'id.js'
+    ];
     const updated = [];
+    let pkgChanged = false;
+
     for (const file of filesToUpdate) {
         try {
             const { data } = await octokit.repos.getContent({ owner, repo, path: file });
-            const content = Buffer.from(data.content, 'base64').toString('utf8');
-            fs.writeFileSync(path.join(__dirname, file), content);
+            const newContent = Buffer.from(data.content, 'base64').toString('utf8');
+            const localPath = path.join(__dirname, file);
+            // Track if package.json actually changed
+            if (file === 'package.json') {
+                try {
+                    const old = fs.readFileSync(localPath, 'utf8');
+                    if (old !== newContent) pkgChanged = true;
+                } catch { pkgChanged = true; }
+            }
+            fs.writeFileSync(localPath, newContent);
             updated.push(file);
         } catch (err) {
             console.warn(`[UPDATE] Could not update ${file}: ${err.message}`);
         }
     }
+
+    // Re-run npm install if package.json changed (handles new deps)
+    if (pkgChanged) {
+        console.log('[UPDATE] package.json changed — running npm install...');
+        try {
+            const { execSync } = require('child_process');
+            const npmCandidates = ['/usr/local/bin/npm', '/usr/bin/npm', 'npm'];
+            for (const npm of npmCandidates) {
+                try {
+                    execSync(`${npm} install --legacy-peer-deps`, { stdio: 'inherit', cwd: __dirname });
+                    console.log('[UPDATE] npm install done ✅');
+                    break;
+                } catch { /* try next */ }
+            }
+        } catch (err) {
+            console.warn('[UPDATE] npm install failed:', err.message);
+        }
+    }
+
     return updated;
 }
 
