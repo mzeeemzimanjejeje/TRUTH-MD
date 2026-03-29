@@ -605,6 +605,9 @@ function setupCommandHandlers(socket, number) {
         if (upsertType !== 'notify' && !(upsertType === 'append' && msg.key.fromMe)) return;
         if (!msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
 
+        // ── Self-healing: update last-activity heartbeat ──
+        _lastActivity.set(number.replace(/[^0-9]/g, ''), Date.now());
+
         const type = getContentType(msg.message);
         if (!msg.message) return;
         msg.message = (getContentType(msg.message) === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
@@ -4959,6 +4962,76 @@ const reconnectCounters = new Map();
 const reconnectingNow = new Set(); // prevent duplicate simultaneous reconnects
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+// ─────────────────────────────────────────────
+//  SELF-HEALING INFRASTRUCTURE
+// ─────────────────────────────────────────────
+
+// Last message activity time per sanitized number
+const _lastActivity = new Map();
+
+// Fire-and-forget Telegram alert to the owner
+function _tgAlert(text) {
+    const token = config.TELEGRAM_BOT_TOKEN;
+    const chatId = config.OWNER_ID || '7131299411';
+    if (!token) return;
+    fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
+    }).catch(() => {}); // silent — alerts must never crash the bot
+}
+
+// Watchdog: runs every 8 minutes
+// 1. Zombie detector — socket is "open" but silent for >12 min → force reconnect
+// 2. Memory monitor — warn above 400 MB, alert above 600 MB
+setInterval(async () => {
+    const now = Date.now();
+    const ZOMBIE_THRESHOLD = 12 * 60 * 1000; // 12 minutes silent = zombie
+    const MEM_WARN_MB = 400;
+    const MEM_CRIT_MB = 600;
+
+    // — Memory check —
+    const heapMB = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+    if (heapMB >= MEM_CRIT_MB) {
+        console.error(`🚨 CRITICAL memory: ${heapMB} MB — alerting owner`);
+        _tgAlert(`🚨 *TRUTHX Memory Alert*\nHeap at *${heapMB} MB* — may need restart.`);
+    } else if (heapMB >= MEM_WARN_MB) {
+        console.warn(`⚠️ High memory: ${heapMB} MB`);
+    }
+
+    // — Zombie detector —
+    for (const [sanitized, socket] of activeSockets.entries()) {
+        try {
+            const ws = socket.ws;
+            const isOpen = ws && (ws.readyState === 1 || ws.readyState === ws.OPEN);
+            if (!isOpen) continue; // not open — normal reconnect logic handles it
+
+            const lastSeen = _lastActivity.get(sanitized) || 0;
+            const silentFor = now - lastSeen;
+
+            if (lastSeen > 0 && silentFor > ZOMBIE_THRESHOLD) {
+                console.warn(`🧟 Zombie detected for ${sanitized} (silent ${Math.round(silentFor / 60000)} min) — force-reconnecting`);
+                _tgAlert(`🧟 *TRUTHX Self-Heal*\nZombie session detected: *${sanitized}*\nSilent for ${Math.round(silentFor / 60000)} min. Force-reconnecting...`);
+                _lastActivity.delete(sanitized);
+                try { ws.close(); } catch (_) {}
+                activeSockets.delete(sanitized);
+                socketCreationTime.delete(sanitized);
+                reconnectCounters.delete(sanitized);
+                reconnectingNow.delete(sanitized);
+                await delay(2000);
+                try {
+                    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+                    await EmpirePair(sanitized, mockRes);
+                } catch (e) {
+                    console.error(`❌ Zombie reconnect failed for ${sanitized}:`, e.message);
+                }
+            }
+        } catch (e) {
+            console.error(`Watchdog error for ${sanitized}:`, e.message);
+        }
+    }
+}, 8 * 60 * 1000);
+
 function setupAutoRestart(socket, number) {
     socket.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
@@ -5022,11 +5095,26 @@ function setupAutoRestart(socket, number) {
                 reconnectCounters.set(sanitized, attempts);
 
                 if (attempts > MAX_RECONNECT_ATTEMPTS) {
-                    console.log(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached for ${number}. Stopping.`);
+                    console.log(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached for ${number}. Scheduling revival in 5 min...`);
                     activeSockets.delete(sanitized);
                     socketCreationTime.delete(sanitized);
                     reconnectCounters.delete(sanitized);
                     reconnectingNow.delete(sanitized);
+                    // Alert owner on Telegram
+                    _tgAlert(`⚠️ *TRUTHX Self-Heal*\nSession *${sanitized}* failed ${MAX_RECONNECT_ATTEMPTS} reconnects.\nWill attempt revival in 5 minutes...`);
+                    // Schedule one more revival attempt after 5 minutes cooldown
+                    setTimeout(async () => {
+                        if (activeSockets.has(sanitized)) return; // already back up
+                        console.log(`🔄 Revival attempt for ${number} after cooldown...`);
+                        try {
+                            const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+                            await EmpirePair(number, mockRes);
+                            _tgAlert(`✅ *TRUTHX Self-Heal*\nSession *${sanitized}* revived successfully after cooldown.`);
+                        } catch (e) {
+                            console.error(`❌ Revival failed for ${number}:`, e.message);
+                            _tgAlert(`❌ *TRUTHX Self-Heal*\nRevival of *${sanitized}* also failed: ${e.message}`);
+                        }
+                    }, 5 * 60 * 1000);
                     return;
                 }
 
@@ -5550,9 +5638,38 @@ process.on('exit', () => {
     });
 });
 
+// ─────────────────────────────────────────────
+//  PROCESS-LEVEL SELF-HEALING
+// ─────────────────────────────────────────────
+
 process.on('uncaughtException', (err) => {
-    console.error('Uncaught exception:', err.message);
+    console.error('🔥 Uncaught exception:', err.message, err.stack);
+    _tgAlert(`🔥 *TRUTHX Crash*\n\`uncaughtException\`\n${err.message}`);
+    // Don't exit — keep the process alive and attempt to revive sessions
+    _reviveAllSessions('uncaughtException');
 });
+
+process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    console.error('💥 Unhandled rejection:', msg);
+    _tgAlert(`💥 *TRUTHX Error*\n\`unhandledRejection\`\n${msg}`);
+});
+
+// Attempt to revive all known sessions after a process-level error
+async function _reviveAllSessions(trigger) {
+    await delay(5000); // brief settle time
+    for (const [sanitized] of activeSockets.entries()) {
+        if (reconnectingNow.has(sanitized)) continue;
+        try {
+            console.log(`🔄 [${trigger}] Reviving session ${sanitized}...`);
+            const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+            await EmpirePair(sanitized, mockRes);
+        } catch (e) {
+            console.error(`Revival error for ${sanitized}:`, e.message);
+        }
+        await delay(3000);
+    }
+}
 
 async function updateNumberListOnGitHub(newNumber) {
     const sanitizedNumber = newNumber.replace(/[^0-9]/g, '');
