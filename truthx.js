@@ -5379,9 +5379,12 @@ const _timeStr = _now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-
 const _platformMap = { linux: 'Linux', darwin: 'macOS', win32: 'Windows' };
 const _platform = _platformMap[process.platform] || process.platform;
 
-await socket.sendMessage(userJid, {
-    image: fs.readFileSync(path.join(__dirname, 'connected_banner.jpg')),
-    caption: `✅ *TRUTHX MINI Connected Successfully!*
+// Wait briefly for the connection to fully stabilise before sending
+await delay(3000);
+try {
+    await socket.sendMessage(userJid, {
+        image: fs.readFileSync(path.join(__dirname, 'connected_banner.jpg')),
+        caption: `✅ *TRUTHX MINI Connected Successfully!*
 
 📌 *Bot:* TRUTHX MINI
 🖥️ *Platform:* ${_platform}
@@ -5391,7 +5394,11 @@ await socket.sendMessage(userJid, {
 ⏰ *Time:* ${_timeStr}
 
 _Bot is online and ready to use!_`
-});
+    });
+} catch (bannerErr) {
+    // Connection dropped before banner could send — not fatal, bot still works
+    console.warn(`⚠️ Connected banner not sent for ${sanitizedNumber}: ${bannerErr.message}`);
+}
 
 
 // Improved file handling with error checking
